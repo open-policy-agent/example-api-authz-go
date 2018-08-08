@@ -1,0 +1,45 @@
+# Gopkg.toml example
+#
+# Refer to https://golang.github.io/dep/docs/Gopkg.toml.html
+# for detailed Gopkg.toml documentation.
+#
+# required = ["github.com/user/thing/cmd/thing"]
+# ignored = ["github.com/user/project/pkgX", "bitbucket.org/user/project/pkgA/pkgY"]
+#
+# [[constraint]]
+#   name = "github.com/user/project"
+#   version = "1.0.0"
+#
+# [[constraint]]
+#   name = "github.com/user/project2"
+#   branch = "dev"
+#   source = "github.com/myfork/project2"
+#
+# [[override]]
+#   name = "github.com/x/y"
+#   version = "2.4.0"
+#
+# [prune]
+#   non-go = false
+#   go-tests = true
+#   unused-packages = true
+
+
+[[constraint]]
+  name = "github.com/open-policy-agent/opa"
+  version = "0.9.0"
+
+[[constraint]]
+  name = "github.com/sirupsen/logrus"
+  version = "1.0.3"
+
+# FIXME(tsandall): added to pin prometheus to same version that is currently in
+# OPA. We should fix OPA to not pull in the server dependency--this will remove
+# the need to pull in prometheus.
+[[override]]
+  name = "github.com/prometheus/client_golang"
+  revision = "a85074fc8513d71c9c2b6c241b8a265a33751dac"
+
+[prune]
+  go-tests = true
+  unused-packages = true
