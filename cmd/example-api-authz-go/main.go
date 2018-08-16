@@ -12,6 +12,7 @@ import (
 
 	"github.com/open-policy-agent/example-api-authz-go/internal/api"
 	"github.com/open-policy-agent/example-api-authz-go/internal/opa"
+	"github.com/open-policy-agent/example-api-authz-go/internal/version"
 	"github.com/sirupsen/logrus"
 )
 
@@ -19,14 +20,13 @@ var configFile = flag.String("config", "", "set the OPA config file to load")
 var verbose = flag.Bool("verbose", false, "enable verbose logging")
 var versionFlag = flag.Bool("version", false, "print version and exit")
 
-const version = "0.1"
-
 func main() {
 
 	flag.Parse()
 
 	if *versionFlag {
-		fmt.Println("Version:", version)
+		fmt.Println("Version:", version.Version)
+		fmt.Println("Vcs:", version.Vcs)
 		os.Exit(0)
 	}
 
