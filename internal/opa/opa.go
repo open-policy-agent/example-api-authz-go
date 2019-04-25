@@ -7,7 +7,6 @@ package opa
 import (
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -15,28 +14,20 @@ import (
 
 	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/plugins"
-	"github.com/open-policy-agent/opa/plugins/bundle"
+	"github.com/open-policy-agent/opa/plugins/discovery"
 	"github.com/open-policy-agent/opa/plugins/logs"
-	"github.com/open-policy-agent/opa/plugins/status"
 	"github.com/open-policy-agent/opa/rego"
 	"github.com/open-policy-agent/opa/server"
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/storage/inmem"
-	"github.com/open-policy-agent/opa/util"
+	"github.com/pkg/errors"
 )
-
-type config struct {
-	Bundle       *json.RawMessage `json:"bundle"`
-	DecisionLogs *json.RawMessage `json:"decision_logs"`
-	Status       *json.RawMessage `json:"status"`
-}
 
 // OPA represents an instance of the policy engine.
 type OPA struct {
-	decision           string
-	configBytes        []byte
-	manager            *plugins.Manager
-	decisionLogsPlugin *logs.Plugin
+	decision    string
+	configBytes []byte
+	manager     *plugins.Manager
 }
 
 // Config sets the configuration file to use on the OPA instance.
@@ -74,40 +65,12 @@ func New(opts ...func(*OPA) error) (*OPA, error) {
 		return nil, err
 	}
 
-	var config config
-
-	if err := util.Unmarshal(opa.configBytes, &config); err != nil {
+	discovery, err := discovery.New(opa.manager)
+	if err != nil {
 		return nil, err
 	}
 
-	var bundlePlugin *bundle.Plugin
-
-	if config.Bundle != nil {
-		bundlePlugin, err = bundle.New(*config.Bundle, opa.manager)
-		if err != nil {
-			return nil, err
-		}
-		opa.manager.Register(bundlePlugin)
-	}
-
-	if config.DecisionLogs != nil {
-		opa.decisionLogsPlugin, err = logs.New(*config.DecisionLogs, opa.manager)
-		if err != nil {
-			return nil, err
-		}
-		opa.manager.Register(opa.decisionLogsPlugin)
-	}
-
-	if config.Status != nil {
-		statusPlugin, err := status.New(*config.Status, opa.manager)
-		if err != nil {
-			return nil, err
-		}
-		opa.manager.Register(statusPlugin)
-		if bundlePlugin != nil {
-			bundlePlugin.Register(string("status"), statusPlugin.Update)
-		}
-	}
+	opa.manager.Register("discovery", discovery)
 
 	return opa, nil
 }
@@ -167,13 +130,13 @@ func (opa *OPA) Bool(ctx context.Context, input interface{}, opts ...func(*rego.
 		return nil
 	})
 
-	if opa.decisionLogsPlugin != nil {
+	if logger := logs.Lookup(opa.manager); logger != nil {
 		record := &server.Info{
 			Revision:   revision,
 			DecisionID: decisionID,
 			Timestamp:  time.Now(),
 			Query:      defaultDecision,
-			Input:      input,
+			Input:      &input,
 			Error:      err,
 			Metrics:    m,
 		}
@@ -181,7 +144,10 @@ func (opa *OPA) Bool(ctx context.Context, input interface{}, opts ...func(*rego.
 			var x interface{} = decision
 			record.Results = &x
 		}
-		opa.decisionLogsPlugin.Log(ctx, record)
+
+		if err := logger.Log(ctx, record); err != nil {
+			return false, errors.Wrap(err, "failed to log decision")
+		}
 	}
 
 	return decision, err
