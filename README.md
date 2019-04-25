@@ -8,7 +8,7 @@ Build the example by running `go build ./cmd/exmaple-api-authz-go/...`
 
 ## Running the example
 
-Run the example with a configuration file:
+Run the example with an [OPA Configuration File](https://www.openpolicyagent.org/docs/configuration.html):
 
 ```bash
 ./example-api-authz-go -config config.yaml
