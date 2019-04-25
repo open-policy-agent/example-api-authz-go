@@ -509,6 +509,19 @@ func makeNumber(loc *Location, text interface{}) (interface{}, error) {
 		// possible.
 		panic("illegal value")
 	}
+
+	// Put limit on size of exponent to prevent non-linear cost of String()
+	// function on big.Float from causing denial of service: https://github.com/golang/go/issues/11068
+	//
+	// n == sign * mantissa * 2^exp
+	// 0.5 <= mantissa < 1.0
+	//
+	// The limit is arbitrary.
+	exp := f.MantExp(nil)
+	if exp > 1e5 || exp < -1e5 {
+		return nil, fmt.Errorf("number too big")
+	}
+
 	return NumberTerm(json.Number(f.String())).SetLocation(loc), nil
 }
 
@@ -551,9 +564,12 @@ func makeComments(c *current, text interface{}) (interface{}, error) {
 
 	comment := NewComment(buf.Bytes())
 	comment.Location = currentLocation(c)
-	comments := c.globalStore[commentsKey].([]*Comment)
-	comments = append(comments, comment)
-	c.globalStore[commentsKey] = comments
-
+	comments := c.globalStore[commentsKey].(map[commentKey]*Comment)
+	key := commentKey{
+		File: comment.Location.File,
+		Row:  comment.Location.Row,
+		Col:  comment.Location.Col,
+	}
+	comments[key] = comment
 	return comment, nil
 }

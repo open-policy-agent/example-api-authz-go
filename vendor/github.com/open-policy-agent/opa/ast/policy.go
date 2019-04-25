@@ -5,6 +5,7 @@
 package ast
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -96,9 +97,17 @@ func IsKeyword(s string) bool {
 }
 
 type (
+	// Node represents a node in an AST. Nodes may be statements in a policy module
+	// or elements of an ad-hoc query, expression, etc.
+	Node interface {
+		fmt.Stringer
+		Loc() *Location
+		SetLoc(*Location)
+	}
+
 	// Statement represents a single statement in a policy module.
 	Statement interface {
-		Loc() *Location
+		Node
 	}
 )
 
@@ -263,11 +272,26 @@ func NewComment(text []byte) *Comment {
 
 // Loc returns the location of the comment in the definition.
 func (c *Comment) Loc() *Location {
+	if c == nil {
+		return nil
+	}
 	return c.Location
+}
+
+// SetLoc sets the location on c.
+func (c *Comment) SetLoc(loc *Location) {
+	c.Location = loc
 }
 
 func (c *Comment) String() string {
 	return "#" + string(c.Text)
+}
+
+// Equal returns true if this comment equals the other comment.
+// Unlike other equality checks on AST nodes, comment equality
+// depends on location.
+func (c *Comment) Equal(other *Comment) bool {
+	return c.Location.Equal(other.Location) && bytes.Equal(c.Text, other.Text)
 }
 
 // Compare returns an integer indicating whether pkg is less than, equal to,
@@ -290,10 +314,23 @@ func (pkg *Package) Equal(other *Package) bool {
 
 // Loc returns the location of the Package in the definition.
 func (pkg *Package) Loc() *Location {
+	if pkg == nil {
+		return nil
+	}
 	return pkg.Location
 }
 
+// SetLoc sets the location on pkg.
+func (pkg *Package) SetLoc(loc *Location) {
+	pkg.Location = loc
+}
+
 func (pkg *Package) String() string {
+	if pkg == nil {
+		return "<illegal nil package>"
+	} else if len(pkg.Path) <= 1 {
+		return fmt.Sprintf("package <illegal path %q>", pkg.Path)
+	}
 	// Omit head as all packages have the DefaultRootDocument prepended at parse time.
 	path := make(Ref, len(pkg.Path)-1)
 	path[0] = VarTerm(string(pkg.Path[1].Value.(String)))
@@ -355,7 +392,15 @@ func (imp *Import) Equal(other *Import) bool {
 
 // Loc returns the location of the Import in the definition.
 func (imp *Import) Loc() *Location {
+	if imp == nil {
+		return nil
+	}
 	return imp.Location
+}
+
+// SetLoc sets the location on imp.
+func (imp *Import) SetLoc(loc *Location) {
+	imp.Location = loc
 }
 
 // Name returns the variable that is used to refer to the imported virtual
@@ -426,7 +471,15 @@ func (rule *Rule) Equal(other *Rule) bool {
 
 // Loc returns the location of the Rule in the definition.
 func (rule *Rule) Loc() *Location {
+	if rule == nil {
+		return nil
+	}
 	return rule.Location
+}
+
+// SetLoc sets the location on rule.
+func (rule *Rule) SetLoc(loc *Location) {
+	rule.Location = loc
 }
 
 // Path returns a ref referring to the document produced by this rule. If rule
@@ -588,6 +641,19 @@ func (head *Head) Vars() VarSet {
 	return vis.vars
 }
 
+// Loc returns the Location of head.
+func (head *Head) Loc() *Location {
+	if head == nil {
+		return nil
+	}
+	return head.Location
+}
+
+// SetLoc sets the location on head.
+func (head *Head) SetLoc(loc *Location) {
+	head.Location = loc
+}
+
 // Copy returns a deep copy of a.
 func (a Args) Copy() Args {
 	cpy := Args{}
@@ -603,6 +669,21 @@ func (a Args) String() string {
 		buf = append(buf, t.String())
 	}
 	return "(" + strings.Join(buf, ", ") + ")"
+}
+
+// Loc returns the Location of a.
+func (a Args) Loc() *Location {
+	if len(a) == 0 {
+		return nil
+	}
+	return a[0].Location
+}
+
+// SetLoc sets the location on a.
+func (a Args) SetLoc(loc *Location) {
+	if len(a) != 0 {
+		a[0].SetLocation(loc)
+	}
 }
 
 // Vars returns a set of vars that appear in a.
@@ -713,7 +794,17 @@ func (body Body) IsGround() bool {
 
 // Loc returns the location of the Body in the definition.
 func (body Body) Loc() *Location {
+	if len(body) == 0 {
+		return nil
+	}
 	return body[0].Location
+}
+
+// SetLoc sets the location on body.
+func (body Body) SetLoc(loc *Location) {
+	if len(body) != 0 {
+		body[0].SetLocation(loc)
+	}
 }
 
 func (body Body) String() string {
@@ -954,6 +1045,19 @@ func (expr *Expr) SetLocation(loc *Location) *Expr {
 	return expr
 }
 
+// Loc returns the Location of expr.
+func (expr *Expr) Loc() *Location {
+	if expr == nil {
+		return nil
+	}
+	return expr.Location
+}
+
+// SetLoc sets the location on expr.
+func (expr *Expr) SetLoc(loc *Location) {
+	expr.SetLocation(loc)
+}
+
 func (expr *Expr) String() string {
 	var buf []string
 	if expr.Negated {
@@ -961,7 +1065,7 @@ func (expr *Expr) String() string {
 	}
 	switch t := expr.Terms.(type) {
 	case []*Term:
-		if expr.IsEquality() {
+		if expr.IsEquality() && validEqAssignArgCount(expr) {
 			buf = append(buf, fmt.Sprintf("%v %v %v", t[1], Equality.Infix, t[2]))
 		} else {
 			buf = append(buf, Call(t).String())
@@ -1045,6 +1149,19 @@ func (w *With) SetLocation(loc *Location) *With {
 	return w
 }
 
+// Loc returns the Location of w.
+func (w *With) Loc() *Location {
+	if w == nil {
+		return nil
+	}
+	return w.Location
+}
+
+// SetLoc sets the location on w.
+func (w *With) SetLoc(loc *Location) {
+	w.Location = loc
+}
+
 // RuleSet represents a collection of rules that produce a virtual document.
 type RuleSet []*Rule
 
@@ -1118,3 +1235,9 @@ type ruleSlice []*Rule
 func (s ruleSlice) Less(i, j int) bool { return Compare(s[i], s[j]) < 0 }
 func (s ruleSlice) Swap(i, j int)      { x := s[i]; s[i] = s[j]; s[j] = x }
 func (s ruleSlice) Len() int           { return len(s) }
+
+// Returns true if the equality or assignment expression referred to by expr
+// has a valid number of arguments.
+func validEqAssignArgCount(expr *Expr) bool {
+	return len(expr.Operands()) == 2
+}

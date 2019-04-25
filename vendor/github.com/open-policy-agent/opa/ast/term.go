@@ -8,12 +8,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/dchest/siphash"
+	"github.com/OneOfOne/xxhash"
 	"github.com/open-policy-agent/opa/util"
 	"github.com/pkg/errors"
 )
@@ -303,6 +304,19 @@ func NewTerm(v Value) *Term {
 func (term *Term) SetLocation(loc *Location) *Term {
 	term.Location = loc
 	return term
+}
+
+// Loc returns the Location of term.
+func (term *Term) Loc() *Location {
+	if term == nil {
+		return nil
+	}
+	return term.Location
+}
+
+// SetLoc sets the location on term.
+func (term *Term) SetLoc(loc *Location) {
+	term.SetLocation(loc)
 }
 
 // Copy returns a deep copy of term.
@@ -622,7 +636,7 @@ func (num Number) Hash() int {
 	f, err := json.Number(num).Float64()
 	if err != nil {
 		bs := []byte(num)
-		h := siphash.Hash(hashSeed0, hashSeed1, bs)
+		h := xxhash.Checksum64(bs)
 		return int(h)
 	}
 	return int(f)
@@ -715,8 +729,7 @@ func (str String) String() string {
 
 // Hash returns the hash code for the Value.
 func (str String) Hash() int {
-	bs := []byte(str)
-	h := siphash.Hash(hashSeed0, hashSeed1, bs)
+	h := xxhash.ChecksumString64S(string(str), hashSeed0)
 	return int(h)
 }
 
@@ -755,8 +768,7 @@ func (v Var) Find(path Ref) (Value, error) {
 
 // Hash returns the hash code for the Value.
 func (v Var) Hash() int {
-	bs := []byte(v)
-	h := siphash.Hash(hashSeed0, hashSeed1, bs)
+	h := xxhash.ChecksumString64S(string(v), hashSeed0)
 	return int(h)
 }
 
@@ -792,6 +804,27 @@ type Ref []*Term
 // EmptyRef returns a new, empty reference.
 func EmptyRef() Ref {
 	return Ref([]*Term{})
+}
+
+// PtrRef returns a new reference against the head for the pointer
+// s. Path components in the pointer are unescaped.
+func PtrRef(head *Term, s string) (Ref, error) {
+	s = strings.Trim(s, "/")
+	if s == "" {
+		return Ref{head}, nil
+	}
+	parts := strings.Split(s, "/")
+	ref := make(Ref, len(parts)+1)
+	ref[0] = head
+	for i := 0; i < len(parts); i++ {
+		var err error
+		parts[i], err = url.PathUnescape(parts[i])
+		if err != nil {
+			return nil, err
+		}
+		ref[i+1] = StringTerm(parts[i])
+	}
+	return ref, nil
 }
 
 // RefTerm creates a new Term with a Ref value.
@@ -956,6 +989,21 @@ func (ref Ref) IsNested() bool {
 	return false
 }
 
+// Ptr returns a slash-separated path string for this ref. If the ref
+// contains non-string terms this function returns an error. Path
+// components are escaped.
+func (ref Ref) Ptr() (string, error) {
+	parts := make([]string, 0, len(ref)-1)
+	for _, term := range ref[1:] {
+		if str, ok := term.Value.(String); ok {
+			parts = append(parts, url.PathEscape(string(str)))
+		} else {
+			return "", fmt.Errorf("invalid path value type")
+		}
+	}
+	return strings.Join(parts, "/"), nil
+}
+
 var varRegexp = regexp.MustCompile("^[[:alpha:]_][[:alpha:][:digit:]_]*$")
 
 func (ref Ref) String() string {
@@ -1116,13 +1164,22 @@ type Set interface {
 
 // NewSet returns a new Set containing t.
 func NewSet(t ...*Term) Set {
-	s := &set{
-		elems: map[int]*setElem{},
-	}
+	s := newset(len(t))
 	for i := range t {
 		s.Add(t[i])
 	}
 	return s
+}
+
+func newset(n int) *set {
+	var keys []*Term
+	if n > 0 {
+		keys = make([]*Term, 0, n)
+	}
+	return &set{
+		elems: make(map[int]*Term, n),
+		keys:  keys,
+	}
 }
 
 // SetTerm returns a new Term representing a set containing terms t.
@@ -1134,21 +1191,8 @@ func SetTerm(t ...*Term) *Term {
 }
 
 type set struct {
-	elems map[int]*setElem
+	elems map[int]*Term
 	keys  []*Term
-}
-
-type setElem struct {
-	elem *Term
-	next *setElem
-}
-
-func (s *setElem) String() string {
-	buf := []string{}
-	for c := s; c != nil; c = c.next {
-		buf = append(buf, fmt.Sprint(c.elem))
-	}
-	return strings.Join(buf, "->")
 }
 
 // Copy returns a deep copy of s.
@@ -1182,7 +1226,7 @@ func (s *set) String() string {
 	}
 	buf := []string{}
 	s.Foreach(func(x *Term) {
-		buf = append(buf, x.String())
+		buf = append(buf, fmt.Sprint(x))
 	})
 	return "{" + strings.Join(buf, ", ") + "}"
 }
@@ -1203,12 +1247,15 @@ func (s *set) Compare(other Value) int {
 	return termSliceCompare(s.keys, t.keys)
 }
 
-// Find returns the current value or a not found error.
+// Find returns the set or dereferences the element itself.
 func (s *set) Find(path Ref) (Value, error) {
 	if len(path) == 0 {
 		return s, nil
 	}
-	return nil, fmt.Errorf("find: not found")
+	if !s.Contains(path[0]) {
+		return nil, fmt.Errorf("find: not found")
+	}
+	return path[0].Value.Find(path[1:])
 }
 
 // Diff returns elements in s that are not in other.
@@ -1224,9 +1271,19 @@ func (s *set) Diff(other Set) Set {
 
 // Intersect returns the set containing elements in both s and other.
 func (s *set) Intersect(other Set) Set {
-	r := NewSet()
-	s.Foreach(func(x *Term) {
-		if other.Contains(x) {
+	o := other.(*set)
+	n, m := s.Len(), o.Len()
+	ss := s
+	so := o
+	if m < n {
+		ss = o
+		so = s
+		n = m
+	}
+
+	r := newset(n)
+	ss.Foreach(func(x *Term) {
+		if so.Contains(x) {
 			r.Add(x)
 		}
 	})
@@ -1344,25 +1401,28 @@ func (s *set) Sorted() Array {
 
 func (s *set) insert(x *Term) {
 	hash := x.Hash()
-	head := s.elems[hash]
-	for curr := head; curr != nil; curr = curr.next {
-		if Compare(curr.elem, x) == 0 {
+	for curr, ok := s.elems[hash]; ok; {
+		if Compare(curr, x) == 0 {
 			return
 		}
+
+		hash++
+		curr, ok = s.elems[hash]
 	}
-	s.elems[hash] = &setElem{
-		elem: x,
-		next: head,
-	}
+
+	s.elems[hash] = x
 	s.keys = append(s.keys, x)
 }
 
-func (s *set) get(x *Term) *setElem {
+func (s *set) get(x *Term) *Term {
 	hash := x.Hash()
-	for curr := s.elems[hash]; curr != nil; curr = curr.next {
-		if Compare(curr.elem, x) == 0 {
+	for curr, ok := s.elems[hash]; ok; {
+		if Compare(curr, x) == 0 {
 			return curr
 		}
+
+		hash++
+		curr, ok = s.elems[hash]
 	}
 	return nil
 }
@@ -1405,8 +1465,13 @@ type object struct {
 }
 
 func newobject(n int) *object {
+	var keys []*Term
+	if n > 0 {
+		keys = make([]*Term, 0, n)
+	}
 	return &object{
 		elems:  make(map[int]*objectElem, n),
+		keys:   keys,
 		ground: true,
 	}
 }
@@ -1495,7 +1560,7 @@ func (obj *object) Get(k *Term) *Term {
 func (obj *object) Hash() int {
 	var hash int
 	obj.Foreach(func(k, v *Term) {
-		hash += v.Value.Hash()
+		hash += k.Value.Hash()
 		hash += v.Value.Hash()
 	})
 	return hash

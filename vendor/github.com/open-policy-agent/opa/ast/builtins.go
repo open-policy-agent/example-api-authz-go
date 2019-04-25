@@ -27,7 +27,6 @@ func RegisterBuiltin(b *Builtin) {
 // by default. When adding a new built-in function to OPA, update this
 // list.
 var DefaultBuiltins = [...]*Builtin{
-
 	// Unification/equality ("=")
 	Equality,
 
@@ -64,6 +63,10 @@ var DefaultBuiltins = [...]*Builtin{
 	Any,
 	All,
 
+	// Arrays
+	ArrayConcat,
+	ArraySlice,
+
 	// Casting
 	ToNumber,
 	CastObject,
@@ -75,7 +78,10 @@ var DefaultBuiltins = [...]*Builtin{
 
 	// Regular Expressions
 	RegexMatch,
+	RegexSplit,
 	GlobsMatch,
+	RegexTemplateMatch,
+	RegexFind,
 
 	// Sets
 	SetDiff,
@@ -113,7 +119,10 @@ var DefaultBuiltins = [...]*Builtin{
 	// Tokens
 	JWTDecode,
 	JWTVerifyRS256,
+	JWTVerifyPS256,
+	JWTVerifyES256,
 	JWTVerifyHS256,
+	JWTDecodeVerify,
 
 	// Time
 	NowNanos,
@@ -149,8 +158,20 @@ var DefaultBuiltins = [...]*Builtin{
 	// Rego
 	RegoParseModule,
 
+	// OPA
+	OPARuntime,
+
 	// Tracing
 	Trace,
+
+	// CIDR
+	NetCIDROverlap,
+	NetCIDRIntersects,
+	NetCIDRContains,
+
+	// Glob
+	GlobMatch,
+	GlobQuoteMeta,
 }
 
 // BuiltinMap provides a convenient mapping of built-in names to
@@ -472,6 +493,35 @@ var Any = &Builtin{
 }
 
 /**
+ * Arrays
+ */
+
+// ArrayConcat returns the result of concatenating two arrays together.
+var ArrayConcat = &Builtin{
+	Name: "array.concat",
+	Decl: types.NewFunction(
+		types.Args(
+			types.NewArray(nil, types.A),
+			types.NewArray(nil, types.A),
+		),
+		types.NewArray(nil, types.A),
+	),
+}
+
+// ArraySlice returns a slice of a given array
+var ArraySlice = &Builtin{
+	Name: "array.slice",
+	Decl: types.NewFunction(
+		types.Args(
+			types.NewArray(nil, types.A),
+			types.NewNumber(),
+			types.NewNumber(),
+		),
+		types.NewArray(nil, types.A),
+	),
+}
+
+/**
  * Casting
  */
 
@@ -566,6 +616,47 @@ var RegexMatch = &Builtin{
 			types.S,
 		),
 		types.B,
+	),
+}
+
+// RegexTemplateMatch takes two strings and evaluates to true if the string in the second
+// position matches the pattern in the first position.
+var RegexTemplateMatch = &Builtin{
+	Name: "regex.template_match",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.S,
+			types.S,
+			types.S,
+		),
+		types.B,
+	),
+}
+
+// RegexSplit splits the input string by the occurences of the given pattern.
+var RegexSplit = &Builtin{
+	Name: "regex.split",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.S,
+		),
+		types.NewArray(nil, types.S),
+	),
+}
+
+// RegexFind takes two strings and a number, the pattern, the value and number of match values to
+// return, -1 means all match values.
+var RegexFind = &Builtin{
+	Name: "regex.find_n",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.S,
+			types.N,
+		),
+		types.NewArray(nil, types.S),
 	),
 }
 
@@ -887,6 +978,30 @@ var JWTVerifyRS256 = &Builtin{
 	),
 }
 
+// JWTVerifyPS256 verifies if a PS256 JWT signature is valid or not.
+var JWTVerifyPS256 = &Builtin{
+	Name: "io.jwt.verify_ps256",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.S,
+		),
+		types.B,
+	),
+}
+
+// JWTVerifyES256 verifies if a ES256 JWT signature is valid or not.
+var JWTVerifyES256 = &Builtin{
+	Name: "io.jwt.verify_es256",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.S,
+		),
+		types.B,
+	),
+}
+
 // JWTVerifyHS256 verifies if a HS256 (secret) JWT signature is valid or not.
 var JWTVerifyHS256 = &Builtin{
 	Name: "io.jwt.verify_hs256",
@@ -896,6 +1011,22 @@ var JWTVerifyHS256 = &Builtin{
 			types.S,
 		),
 		types.B,
+	),
+}
+
+// JWTDecodeVerify verifies a JWT signature under parameterized constraints and decodes the claims if it is valid.
+var JWTDecodeVerify = &Builtin{
+	Name: "io.jwt.decode_verify",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.NewObject(nil, types.NewDynamicProperty(types.S, types.A)),
+		),
+		types.NewArray([]types.Type{
+			types.B,
+			types.NewObject(nil, types.NewDynamicProperty(types.A, types.A)),
+			types.NewObject(nil, types.NewDynamicProperty(types.A, types.A)),
+		}, nil),
 	),
 }
 
@@ -1155,6 +1286,20 @@ var RegoParseModule = &Builtin{
 }
 
 /**
+ * OPA
+ */
+
+// OPARuntime returns an object containing OPA runtime information such as the
+// configuration that OPA was booted with.
+var OPARuntime = &Builtin{
+	Name: "opa.runtime",
+	Decl: types.NewFunction(
+		nil,
+		types.NewObject(nil, types.NewDynamicProperty(types.S, types.A)),
+	),
+}
+
+/**
  * Trace
  */
 
@@ -1196,6 +1341,62 @@ var Union = &Builtin{
 }
 
 /**
+ * Glob
+ */
+
+// GlobMatch - not to be confused with regex.globs_match - parses and matches strings against the glob notation.
+var GlobMatch = &Builtin{
+	Name: "glob.match",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.NewArray(nil, types.S),
+			types.S,
+		),
+		types.B,
+	),
+}
+
+// GlobQuoteMeta returns a string which represents a version of the pattern where all asterisks have been escaped.
+var GlobQuoteMeta = &Builtin{
+	Name: "glob.quote_meta",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+		),
+		types.S,
+	),
+}
+
+/**
+ * Net CIDR
+ */
+
+// NetCIDRIntersects checks if a cidr intersects with another cidr and returns true or false
+var NetCIDRIntersects = &Builtin{
+	Name: "net.cidr_intersects",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.S,
+		),
+		types.B,
+	),
+}
+
+// NetCIDRContains checks if a cidr or ip is contained within another cidr and returns true or false
+var NetCIDRContains = &Builtin{
+	Name: "net.cidr_contains",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.S,
+		),
+		types.B,
+	),
+}
+
+/**
  * Deprecated built-ins.
  */
 
@@ -1208,6 +1409,18 @@ var SetDiff = &Builtin{
 			types.NewSet(types.A),
 		),
 		types.NewSet(types.A),
+	),
+}
+
+// NetCIDROverlap has been replaced by the `net.cidr_contains` built-in.
+var NetCIDROverlap = &Builtin{
+	Name: "net.cidr_overlap",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.S,
+		),
+		types.B,
 	),
 }
 

@@ -6,11 +6,17 @@
 package rego
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/internal/compiler/wasm"
+	"github.com/open-policy-agent/opa/internal/ir"
+	"github.com/open-policy-agent/opa/internal/planner"
+	"github.com/open-policy-agent/opa/internal/wasm/encoding"
 	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/storage/inmem"
@@ -19,6 +25,12 @@ import (
 )
 
 const defaultPartialNamespace = "partial"
+
+// CompileResult represents sthe result of compiling a Rego query, zero or more
+// Rego modules, and arbitrary contextual data into an executable.
+type CompileResult struct {
+	Bytes []byte `json:"bytes"`
+}
 
 // PartialQueries contains the queries and support modules produced by partial
 // evaluation.
@@ -77,6 +89,10 @@ func newExpressionValue(expr *ast.Expr, value interface{}) *ExpressionValue {
 	}
 }
 
+func (ev *ExpressionValue) String() string {
+	return fmt.Sprint(ev.Value)
+}
+
 // ResultSet represents a collection of output from Rego evaluation. An empty
 // result set represents an undefined query.
 type ResultSet []Result
@@ -132,11 +148,22 @@ type Rego struct {
 	store            storage.Store
 	txn              storage.Transaction
 	metrics          metrics.Metrics
-	tracer           topdown.Tracer
+	tracers          []topdown.Tracer
+	tracebuf         *topdown.BufferTracer
+	trace            bool
 	instrumentation  *topdown.Instrumentation
 	instrument       bool
 	capture          map[*ast.Expr]ast.Var // map exprs to generated capture vars
 	termVarID        int
+	dump             io.Writer
+	runtime          *ast.Term
+}
+
+// Dump returns an argument that sets the writer to dump debugging information to.
+func Dump(w io.Writer) func(r *Rego) {
+	return func(r *Rego) {
+		r.dump = w
+	}
 }
 
 // Query returns an argument that sets the Rego query.
@@ -271,13 +298,37 @@ func Instrument(yes bool) func(r *Rego) {
 	}
 }
 
-// Tracer returns an argument that sets the topdown Tracer.
+// Trace returns an argument that enables tracing on r.
+func Trace(yes bool) func(r *Rego) {
+	return func(r *Rego) {
+		r.trace = yes
+	}
+}
+
+// Tracer returns an argument that adds a query tracer to r.
 func Tracer(t topdown.Tracer) func(r *Rego) {
 	return func(r *Rego) {
 		if t != nil {
-			r.tracer = t
+			r.tracers = append(r.tracers, t)
 		}
 	}
+}
+
+// Runtime returns an argument that sets the runtime data to provide to the
+// evaluation engine.
+func Runtime(term *ast.Term) func(r *Rego) {
+	return func(r *Rego) {
+		r.runtime = term
+	}
+}
+
+// PrintTrace is a helper fnuction to write a human-readable version of the
+// trace to the writer w.
+func PrintTrace(w io.Writer, r *Rego) {
+	if r == nil || r.tracebuf == nil {
+		return
+	}
+	topdown.PrettyTrace(w, *r.tracebuf)
 }
 
 // New returns a new Rego object.
@@ -307,6 +358,11 @@ func New(options ...func(*Rego)) *Rego {
 		r.instrumentation = topdown.NewInstrumentation(r.metrics)
 	}
 
+	if r.trace {
+		r.tracebuf = topdown.NewBufferTracer()
+		r.tracers = append(r.tracers, r.tracebuf)
+	}
+
 	return r
 }
 
@@ -322,7 +378,17 @@ func (r *Rego) Eval(ctx context.Context) (ResultSet, error) {
 		return nil, err
 	}
 
-	err = r.compileModules(parsed)
+	txn := r.txn
+
+	if txn == nil {
+		txn, err = r.store.NewTransaction(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer r.store.Abort(ctx, txn)
+	}
+
+	err = r.compileModules(ctx, txn, parsed)
 	if err != nil {
 		return nil, err
 	}
@@ -336,16 +402,6 @@ func (r *Rego) Eval(ctx context.Context) (ResultSet, error) {
 
 	if err != nil {
 		return nil, err
-	}
-
-	txn := r.txn
-
-	if txn == nil {
-		txn, err = r.store.NewTransaction(ctx)
-		if err != nil {
-			return nil, err
-		}
-		defer r.store.Abort(ctx, txn)
 	}
 
 	return r.eval(ctx, qc, compiled, txn)
@@ -368,7 +424,17 @@ func (r *Rego) PartialResult(ctx context.Context) (PartialResult, error) {
 		return PartialResult{}, err
 	}
 
-	err = r.compileModules(parsed)
+	txn := r.txn
+
+	if txn == nil {
+		txn, err = r.store.NewTransaction(ctx)
+		if err != nil {
+			return PartialResult{}, err
+		}
+		defer r.store.Abort(ctx, txn)
+	}
+
+	err = r.compileModules(ctx, txn, parsed)
 	if err != nil {
 		return PartialResult{}, err
 	}
@@ -382,16 +448,6 @@ func (r *Rego) PartialResult(ctx context.Context) (PartialResult, error) {
 
 	if err != nil {
 		return PartialResult{}, err
-	}
-
-	txn := r.txn
-
-	if txn == nil {
-		txn, err = r.store.NewTransaction(ctx)
-		if err != nil {
-			return PartialResult{}, err
-		}
-		defer r.store.Abort(ctx, txn)
 	}
 
 	partialNamespace := r.partialNamespace
@@ -414,16 +470,6 @@ func (r *Rego) Partial(ctx context.Context) (*PartialQueries, error) {
 		return nil, err
 	}
 
-	err = r.compileModules(parsed)
-	if err != nil {
-		return nil, err
-	}
-
-	_, compiled, err := r.compileQuery(nil, query)
-	if err != nil {
-		return nil, err
-	}
-
 	txn := r.txn
 
 	if txn == nil {
@@ -434,6 +480,16 @@ func (r *Rego) Partial(ctx context.Context) (*PartialQueries, error) {
 		defer r.store.Abort(ctx, txn)
 	}
 
+	err = r.compileModules(ctx, txn, parsed)
+	if err != nil {
+		return nil, err
+	}
+
+	_, compiled, err := r.compileQuery(nil, query)
+	if err != nil {
+		return nil, err
+	}
+
 	partialNamespace := r.partialNamespace
 	if partialNamespace == "" {
 		partialNamespace = defaultPartialNamespace
@@ -442,10 +498,51 @@ func (r *Rego) Partial(ctx context.Context) (*PartialQueries, error) {
 	return r.partial(ctx, compiled, txn, partialNamespace)
 }
 
+// Compile returnss a compiled policy query.
+func (r *Rego) Compile(ctx context.Context) (*CompileResult, error) {
+
+	pq, err := r.Partial(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(pq.Support) > 0 {
+		return nil, fmt.Errorf("modules not supported")
+	}
+
+	policy, err := planner.New().WithQueries(pq.Queries).Plan()
+	if err != nil {
+		return nil, err
+	}
+
+	if r.dump != nil {
+		fmt.Fprintln(r.dump, "PLAN:")
+		fmt.Fprintln(r.dump, "-----")
+		ir.Pretty(r.dump, policy)
+		fmt.Fprintln(r.dump)
+	}
+
+	m, err := wasm.New().WithPolicy(policy).Compile()
+	if err != nil {
+		return nil, err
+	}
+
+	var out bytes.Buffer
+
+	if err := encoding.WriteModule(&out, m); err != nil {
+		return nil, err
+	}
+
+	result := &CompileResult{
+		Bytes: out.Bytes(),
+	}
+
+	return result, nil
+}
+
 func (r *Rego) parse() (map[string]*ast.Module, ast.Body, error) {
 
-	r.metrics.Timer(metrics.RegoQueryParse).Start()
-	defer r.metrics.Timer(metrics.RegoQueryParse).Stop()
+	r.metrics.Timer(metrics.RegoModuleParse).Start()
 
 	var errs Errors
 	parsed := map[string]*ast.Module{}
@@ -457,6 +554,10 @@ func (r *Rego) parse() (map[string]*ast.Module, ast.Body, error) {
 		}
 		parsed[module.filename] = p
 	}
+
+	r.metrics.Timer(metrics.RegoModuleParse).Stop()
+	r.metrics.Timer(metrics.RegoQueryParse).Start()
+	defer r.metrics.Timer(metrics.RegoQueryParse).Stop()
 
 	var query ast.Body
 
@@ -476,13 +577,13 @@ func (r *Rego) parse() (map[string]*ast.Module, ast.Body, error) {
 	return parsed, query, nil
 }
 
-func (r *Rego) compileModules(modules map[string]*ast.Module) error {
+func (r *Rego) compileModules(ctx context.Context, txn storage.Transaction, modules map[string]*ast.Module) error {
 
 	r.metrics.Timer(metrics.RegoModuleCompile).Start()
 	defer r.metrics.Timer(metrics.RegoModuleCompile).Stop()
 
 	if len(modules) > 0 {
-		r.compiler.Compile(modules)
+		r.compiler.WithPathConflictsCheck(storage.NonEmpty(ctx, r.store, txn)).Compile(modules)
 		if r.compiler.Failed() {
 			var errs Errors
 			for _, err := range r.compiler.Errors {
@@ -568,10 +669,11 @@ func (r *Rego) eval(ctx context.Context, qc ast.QueryCompiler, compiled ast.Body
 		WithStore(r.store).
 		WithTransaction(txn).
 		WithMetrics(r.metrics).
-		WithInstrumentation(r.instrumentation)
+		WithInstrumentation(r.instrumentation).
+		WithRuntime(r.runtime)
 
-	if r.tracer != nil {
-		q = q.WithTracer(r.tracer)
+	for i := range r.tracers {
+		q = q.WithTracer(r.tracers[i])
 	}
 
 	if r.input != nil {
@@ -688,7 +790,7 @@ func (r *Rego) partial(ctx context.Context, compiled ast.Body, txn storage.Trans
 		}
 	} else {
 		// Use input document as unknown if caller has not specified any.
-		unknowns = []*ast.Term{ast.InputRootDocument}
+		unknowns = []*ast.Term{ast.NewTerm(ast.InputRootRef)}
 	}
 
 	// Check partial namespace to ensure it's valid.
@@ -705,10 +807,10 @@ func (r *Rego) partial(ctx context.Context, compiled ast.Body, txn storage.Trans
 		WithMetrics(r.metrics).
 		WithInstrumentation(r.instrumentation).
 		WithUnknowns(unknowns).
-		WithPartialNamespace(partialNamespace)
+		WithRuntime(r.runtime)
 
-	if r.tracer != nil {
-		q = q.WithTracer(r.tracer)
+	for i := range r.tracers {
+		q = q.WithTracer(r.tracers[i])
 	}
 
 	if r.input != nil {
@@ -773,6 +875,7 @@ func (r *Rego) rewriteQueryToCaptureValue(qc ast.QueryCompiler, query ast.Body) 
 			cpy := expr.Copy()
 			cpy.Terms = capture
 			cpy.Generated = true
+			cpy.With = nil
 			query.Append(cpy)
 		}
 	}
