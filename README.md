@@ -4,7 +4,7 @@ This repository shows how to integrate a service written in Go with OPA to perfo
 
 ## Building
 
-Build the example by running `go build ./cmd/exmaple-api-authz-go/...`
+Build the example by running `go build ./cmd/example-api-authz-go/...`
 
 ## Requirements
 
