@@ -7,41 +7,54 @@ package bundle
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
-	"strings"
 	"sync"
 
+	"github.com/sirupsen/logrus"
+
+	"github.com/open-policy-agent/opa/metrics"
+
 	"github.com/open-policy-agent/opa/ast"
+
 	"github.com/open-policy-agent/opa/bundle"
 	"github.com/open-policy-agent/opa/download"
-	"github.com/open-policy-agent/opa/internal/manifest"
 	"github.com/open-policy-agent/opa/plugins"
 	"github.com/open-policy-agent/opa/storage"
-	"github.com/sirupsen/logrus"
 )
 
 // Plugin implements bundle activation.
 type Plugin struct {
-	config     Config
-	manager    *plugins.Manager             // plugin manager for storage and service clients
-	status     *Status                      // current plugin status
-	etag       string                       // etag on last successful activation
-	listeners  map[interface{}]func(Status) // listeners to send status updates to
-	downloader *download.Downloader
-	mtx        sync.Mutex
+	config        Config
+	manager       *plugins.Manager                         // plugin manager for storage and service clients
+	status        map[string]*Status                       // current status for each bundle
+	etags         map[string]string                        // etag on last successful activation
+	listeners     map[interface{}]func(Status)             // listeners to send status updates to
+	bulkListeners map[interface{}]func(map[string]*Status) // listeners to send aggregated status updates to
+	downloaders   map[string]*download.Downloader
+	mtx           sync.Mutex
+	cfgMtx        sync.Mutex
+	legacyConfig  bool
 }
 
 // New returns a new Plugin with the given config.
 func New(parsedConfig *Config, manager *plugins.Manager) *Plugin {
-	p := &Plugin{
-		manager: manager,
-		config:  *parsedConfig,
-		status: &Status{
-			Name: parsedConfig.Name,
-		},
+	initialStatus := map[string]*Status{}
+	for name := range parsedConfig.Bundles {
+		initialStatus[name] = &Status{
+			Name: name,
+		}
 	}
-	p.initDownloader()
+
+	p := &Plugin{
+		manager:     manager,
+		config:      *parsedConfig,
+		status:      initialStatus,
+		downloaders: make(map[string]*download.Downloader),
+		etags:       make(map[string]string),
+	}
+	p.initDownloaders()
 	return p
 }
 
@@ -60,40 +73,113 @@ func Lookup(manager *plugins.Manager) *Plugin {
 // from the configured service. When a new bundle is downloaded, the data and
 // policies are extracted and inserted into storage.
 func (p *Plugin) Start(ctx context.Context) error {
-	p.logInfo("Starting bundle downloader.")
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
-	p.downloader.Start(ctx)
+	for name, dl := range p.downloaders {
+		p.logInfo(name, "Starting bundle downloader.")
+		dl.Start(ctx)
+	}
 	return nil
 }
 
 // Stop stops the plugin.
 func (p *Plugin) Stop(ctx context.Context) {
-	p.logInfo("Stopping bundle downloader.")
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
-	p.downloader.Stop(ctx)
+	for name, dl := range p.downloaders {
+		p.logInfo(name, "Stopping bundle downloader.")
+		dl.Stop(ctx)
+	}
 }
 
 // Reconfigure notifies the plugin that it's configuration has changed.
+// Any bundle configs that have changed or been added/removed will take
+// affect.
 func (p *Plugin) Reconfigure(ctx context.Context, config interface{}) {
-	p.mtx.Lock()
-	defer p.mtx.Unlock()
+	// Reconfiguring should not occur in parallel, lock to ensure
+	// nothing swaps underneath us with the current p.config and the updated one.
+	// Use p.cfgMtx instead of p.mtx so as to not block any bundle downloads/activations
+	// that are in progress. We upgrade to p.mtx locking after stopping downloaders.
+	p.cfgMtx.Lock()
+	defer p.cfgMtx.Unlock()
 
+	// Look for any bundles that have had their config changed, are new, or have been removed
 	newConfig := config.(*Config)
-	if reflect.DeepEqual(p.config, *newConfig) {
-		p.logDebug("Bundle downloader configuration unchanged.")
+	newBundles, updatedBundles, deletedBundles := p.configDelta(newConfig)
+	p.config = *newConfig
+
+	if len(updatedBundles) == 0 && len(newBundles) == 0 && len(deletedBundles) == 0 {
+		// no relevant config changes
 		return
 	}
 
-	p.logInfo("Bundle downloader configuration changed. Restarting bundle downloader.")
-	p.config = *config.(*Config)
-	p.downloader.Stop(ctx)
-	p.initDownloader()
-	p.downloader.Start(ctx)
+	// Stop the downloaders outside p.mtx to allow them to finish handling any in-progress requests.
+	for name, dl := range p.downloaders {
+		_, updated := updatedBundles[name]
+		_, deleted := deletedBundles[name]
+		if updated || deleted {
+			dl.Stop(ctx)
+		}
+	}
+
+	// Only lock p.mtx once we start changing the internal maps
+	// and downloader configs.
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+
+	// Cleanup existing downloaders that are deleted
+	for name := range p.downloaders {
+		if _, deleted := deletedBundles[name]; deleted {
+			p.logInfo(name, "Bundle downloader configuration removed. Stopping bundle downloader.")
+			delete(p.downloaders, name)
+			delete(p.status, name)
+			delete(p.etags, name)
+		}
+	}
+
+	// Deactivate the bundles that were removed
+	params := storage.WriteParams
+	params.Context = storage.NewContext()
+	err := storage.Txn(ctx, p.manager.Store, params, func(txn storage.Transaction) error {
+		opts := &bundle.DeactivateOpts{
+			Ctx:         ctx,
+			Store:       p.manager.Store,
+			Txn:         txn,
+			BundleNames: deletedBundles,
+		}
+		err := bundle.Deactivate(opts)
+		if err != nil {
+			p.logError(fmt.Sprint(deletedBundles), "Failed to deactivate bundles: %s", err)
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		// TODO(patrick-east): This probably shouldn't panic.. But OPA shouldn't
+		// continue in a potentially inconsistent state.
+		panic(errors.New("Unable deactivate bundle: " + err.Error()))
+	}
+
+	for name, source := range p.config.Bundles {
+		_, updated := updatedBundles[name]
+		_, isNew := newBundles[name]
+
+		if isNew || updated {
+			if isNew {
+				p.status[name] = &Status{Name: name}
+				p.logInfo(name, "New bundle downloader configuration added. Starting bundle downloader.")
+			} else {
+				p.logInfo(name, "Bundle downloader configuration changed. Restarting bundle downloader.")
+			}
+			p.downloaders[name] = p.newDownloader(name, source)
+			p.downloaders[name].Start(ctx)
+		}
+	}
 }
 
 // Register a listener to receive status updates. The name must be comparable.
+// The listener will receive a status update for each bundle configured, they are
+// not going to be aggregated. For all status updates use `RegisterBulkListener`.
 func (p *Plugin) Register(name interface{}, listener func(Status)) {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
@@ -110,244 +196,190 @@ func (p *Plugin) Unregister(name interface{}) {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
 
-	delete(p.listeners, name)
+	delete(p.bulkListeners, name)
 }
 
-func (p *Plugin) initDownloader() {
-	client := p.manager.Client(p.config.Service)
-	path := p.generateDownloadPath(*(p.config.Prefix), p.config.Name)
-	p.downloader = download.New(p.config.Config, client, path).WithCallback(p.oneShot)
-}
-
-func (p *Plugin) generateDownloadPath(prefix string, name string) string {
-	res := ""
-	trimmedPrefix := strings.Trim(prefix, "/")
-	if trimmedPrefix != "" {
-		res += trimmedPrefix + "/"
-	}
-
-	res += strings.Trim(name, "/")
-
-	return res
-}
-
-func (p *Plugin) oneShot(ctx context.Context, u download.Update) {
+// RegisterBulkListener registers a listener to receive bulk (aggregated) status updates. The name must be comparable.
+func (p *Plugin) RegisterBulkListener(name interface{}, listener func(map[string]*Status)) {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
 
-	p.process(ctx, u)
-	status := *p.status
+	if p.bulkListeners == nil {
+		p.bulkListeners = map[interface{}]func(map[string]*Status){}
+	}
 
-	for _, listener := range p.listeners {
-		listener(status)
+	p.bulkListeners[name] = listener
+}
+
+// UnregisterBulkListener unregisters a listener to stop receiving aggregated status updates.
+func (p *Plugin) UnregisterBulkListener(name interface{}) {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+
+	delete(p.bulkListeners, name)
+}
+
+// Config returns the plugins current configuration
+func (p *Plugin) Config() *Config {
+	return &p.config
+}
+
+func (p *Plugin) initDownloaders() {
+	// Initialize a downloader for each bundle configured.
+	for name, source := range p.config.Bundles {
+		p.downloaders[name] = p.newDownloader(name, source)
 	}
 }
 
-func (p *Plugin) process(ctx context.Context, u download.Update) {
+func (p *Plugin) newDownloader(name string, source *Source) *download.Downloader {
+	conf := source.Config
+	client := p.manager.Client(source.Service)
+	path := source.Resource
+	return download.New(conf, client, path).WithCallback(func(ctx context.Context, u download.Update) {
+		// wrap the callback to include the name of the bundle that was updated
+		p.oneShot(ctx, name, u)
+	})
+}
+
+func (p *Plugin) oneShot(ctx context.Context, name string, u download.Update) {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+
+	p.process(ctx, name, u)
+
+	for _, listener := range p.listeners {
+		listener(*p.status[name])
+	}
+
+	for _, listener := range p.bulkListeners {
+		listener(p.status)
+	}
+}
+
+func (p *Plugin) process(ctx context.Context, name string, u download.Update) {
+
+	if u.Metrics != nil {
+		p.status[name].Metrics = u.Metrics
+	} else {
+		p.status[name].Metrics = metrics.New()
+	}
 
 	if u.Error != nil {
-		p.logError("Bundle download failed: %v", u.Error)
-		p.status.SetError(u.Error)
+		p.logError(name, "Bundle download failed: %v", u.Error)
+		p.status[name].SetError(u.Error)
 		return
 	}
 
 	if u.Bundle != nil {
-		p.status.SetDownloadSuccess()
+		p.status[name].SetDownloadSuccess()
 
-		if err := p.activate(ctx, u.Bundle); err != nil {
-			p.logError("Bundle activation failed: %v", err)
-			p.status.SetError(err)
+		p.status[name].Metrics.Timer(metrics.RegoLoadBundles).Start()
+		defer p.status[name].Metrics.Timer(metrics.RegoLoadBundles).Stop()
+
+		if err := p.activate(ctx, name, u.Bundle); err != nil {
+			p.logError(name, "Bundle activation failed: %v", err)
+			p.status[name].SetError(err)
 			return
 		}
 
-		p.status.SetError(nil)
-		p.status.SetActivateSuccess(u.Bundle.Manifest.Revision)
+		p.status[name].SetError(nil)
+		p.status[name].SetActivateSuccess(u.Bundle.Manifest.Revision)
 		if u.ETag != "" {
-			p.logInfo("Bundle downloaded and activated successfully. Etag updated to %v.", u.ETag)
+			p.logInfo(name, "Bundle downloaded and activated successfully. Etag updated to %v.", u.ETag)
 		} else {
-			p.logInfo("Bundle downloaded and activated successfully.")
+			p.logInfo(name, "Bundle downloaded and activated successfully.")
 		}
-		p.etag = u.ETag
+		p.etags[name] = u.ETag
 		return
 	}
 
-	if u.ETag == p.etag {
-		p.logDebug("Bundle download skipped, server replied with not modified.")
-		p.status.SetError(nil)
+	if etag, ok := p.etags[name]; ok && u.ETag == etag {
+		p.logDebug(name, "Bundle download skipped, server replied with not modified.")
+		p.status[name].SetError(nil)
 		return
 	}
 }
 
-func (p *Plugin) activate(ctx context.Context, b *bundle.Bundle) error {
-	p.logDebug("Bundle activation in progress. Opening storage transaction.")
+func (p *Plugin) activate(ctx context.Context, name string, b *bundle.Bundle) error {
+	p.logDebug(name, "Bundle activation in progress. Opening storage transaction.")
 
-	return storage.Txn(ctx, p.manager.Store, storage.WriteParams, func(txn storage.Transaction) error {
-		p.logDebug("Opened storage transaction (%v).", txn.ID())
-		defer p.logDebug("Closing storage transaction (%v).", txn.ID())
+	params := storage.WriteParams
+	params.Context = storage.NewContext()
 
-		// Build set of roots from old and new bundles. This set of
-		// roots should be erased.
-		erase := map[string]struct{}{}
+	err := storage.Txn(ctx, p.manager.Store, params, func(txn storage.Transaction) error {
+		p.logDebug(name, "Opened storage transaction (%v).", txn.ID())
+		defer p.logDebug(name, "Closing storage transaction (%v).", txn.ID())
 
-		if b.Manifest.Roots != nil {
-			for _, root := range *b.Manifest.Roots {
-				erase[root] = struct{}{}
-			}
+		// Compile the bundle modules with a new compiler and set it on the
+		// transaction params for use by onCommit hooks.
+		compiler := ast.NewCompiler().WithPathConflictsCheck(storage.NonEmpty(ctx, p.manager.Store, txn))
+
+		var activateErr error
+
+		opts := &bundle.ActivateOpts{
+			Ctx:      ctx,
+			Store:    p.manager.Store,
+			Txn:      txn,
+			Compiler: compiler,
+			Metrics:  p.status[name].Metrics,
+			Bundles:  map[string]*bundle.Bundle{name: b},
 		}
 
-		if roots, err := manifest.ReadBundleRoots(ctx, p.manager.Store, txn); err == nil {
-			for _, root := range roots {
-				erase[root] = struct{}{}
-			}
-		} else if !storage.IsNotFound(err) {
-			return err
+		if p.config.IsMultiBundle() {
+			activateErr = bundle.Activate(opts)
+		} else {
+			activateErr = bundle.ActivateLegacy(opts)
 		}
 
-		if err := p.eraseData(ctx, txn, erase); err != nil {
-			return err
-		}
+		plugins.SetCompilerOnContext(params.Context, compiler)
 
-		if err := p.erasePolicies(ctx, txn, erase); err != nil {
-			return err
-		}
-
-		// Write data from new bundle into store. Only write under the
-		// roots contained in the manifest.
-		if err := p.writeData(ctx, txn, *b.Manifest.Roots, b.Data); err != nil {
-			return err
-		}
-
-		if err := p.writeModules(ctx, txn, b.Modules); err != nil {
-			return err
-		}
-
-		if err := manifest.Write(ctx, p.manager.Store, txn, b.Manifest); err != nil {
-			return err
-		}
-
-		return nil
+		return activateErr
 	})
+
+	return err
 }
 
-func (p *Plugin) eraseData(ctx context.Context, txn storage.Transaction, roots map[string]struct{}) error {
-	for root := range roots {
-		path, ok := storage.ParsePathEscaped("/" + root)
-		if !ok {
-			return fmt.Errorf("manifest root path invalid: %v", root)
-		}
-		if len(path) > 0 {
-			if err := p.manager.Store.Write(ctx, txn, storage.RemoveOp, path, nil); err != nil {
-				if !storage.IsNotFound(err) {
-					return err
-				}
-			}
-		}
-	}
-	return nil
+func (p *Plugin) logError(bundleName string, fmt string, a ...interface{}) {
+	logrus.WithFields(p.logrusFields(bundleName)).Errorf(fmt, a...)
 }
 
-func (p *Plugin) erasePolicies(ctx context.Context, txn storage.Transaction, roots map[string]struct{}) error {
-	ids, err := p.manager.Store.ListPolicies(ctx, txn)
-	if err != nil {
-		return err
-	}
-	for _, id := range ids {
-		bs, err := p.manager.Store.GetPolicy(ctx, txn, id)
-		if err != nil {
-			return err
-		}
-		module, err := ast.ParseModule(id, string(bs))
-		if err != nil {
-			return err
-		}
-		path, err := module.Package.Path.Ptr()
-		if err != nil {
-			return err
-		}
-		for root := range roots {
-			if strings.HasPrefix(path, root) {
-				if err := p.manager.Store.DeletePolicy(ctx, txn, id); err != nil {
-					return err
-				}
-				break
-			}
-		}
-	}
-	return nil
+func (p *Plugin) logInfo(bundleName string, fmt string, a ...interface{}) {
+	logrus.WithFields(p.logrusFields(bundleName)).Infof(fmt, a...)
 }
 
-func (p *Plugin) writeData(ctx context.Context, txn storage.Transaction, roots []string, data map[string]interface{}) error {
-	for _, root := range roots {
-		path, ok := storage.ParsePathEscaped("/" + root)
-		if !ok {
-			return fmt.Errorf("manifest root path invalid: %v", root)
-		}
-		if value, ok := lookup(path, data); ok {
-			if len(path) > 0 {
-				if err := storage.MakeDir(ctx, p.manager.Store, txn, path[:len(path)-1]); err != nil {
-					return err
-				}
-			}
-			if err := p.manager.Store.Write(ctx, txn, storage.AddOp, path, value); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+func (p *Plugin) logDebug(bundleName string, fmt string, a ...interface{}) {
+	logrus.WithFields(p.logrusFields(bundleName)).Debugf(fmt, a...)
 }
 
-func (p *Plugin) writeModules(ctx context.Context, txn storage.Transaction, files []bundle.ModuleFile) error {
-	modules := map[string]*ast.Module{}
-	for _, file := range files {
-		modules[file.Path] = file.Parsed
-	}
-	compiler := ast.NewCompiler().
-		WithPathConflictsCheck(storage.NonEmpty(ctx, p.manager.Store, txn))
-	if compiler.Compile(modules); compiler.Failed() {
-		return compiler.Errors
-	}
-	for _, file := range files {
-		if err := p.manager.Store.UpsertPolicy(ctx, txn, file.Path, file.Raw); err != nil {
-			return err
-		}
-	}
-	return nil
-}
+func (p *Plugin) logrusFields(bundleName string) logrus.Fields {
 
-func (p *Plugin) logError(fmt string, a ...interface{}) {
-	logrus.WithFields(p.logrusFields()).Errorf(fmt, a...)
-}
-
-func (p *Plugin) logInfo(fmt string, a ...interface{}) {
-	logrus.WithFields(p.logrusFields()).Infof(fmt, a...)
-}
-
-func (p *Plugin) logDebug(fmt string, a ...interface{}) {
-	logrus.WithFields(p.logrusFields()).Debugf(fmt, a...)
-}
-
-func (p *Plugin) logrusFields() logrus.Fields {
-	return logrus.Fields{
+	f := logrus.Fields{
 		"plugin": Name,
-		"name":   p.config.Name,
+		"name":   bundleName,
 	}
+
+	return f
 }
 
-func lookup(path storage.Path, data map[string]interface{}) (interface{}, bool) {
-	if len(path) == 0 {
-		return data, true
+// configDelta will return a map of new bundle sources, updated bundle sources, and a set of deleted bundle names
+func (p *Plugin) configDelta(newConfig *Config) (map[string]*Source, map[string]*Source, map[string]struct{}) {
+	deletedBundles := map[string]struct{}{}
+	for name := range p.config.Bundles {
+		deletedBundles[name] = struct{}{}
 	}
-	for i := 0; i < len(path)-1; i++ {
-		value, ok := data[path[i]]
-		if !ok {
-			return nil, false
+	newBundles := map[string]*Source{}
+	updatedBundles := map[string]*Source{}
+	for name, source := range newConfig.Bundles {
+		oldSource, found := p.config.Bundles[name]
+		if !found {
+			newBundles[name] = source
+		} else {
+			delete(deletedBundles, name)
+			if !reflect.DeepEqual(oldSource, source) {
+				updatedBundles[name] = source
+			}
 		}
-		obj, ok := value.(map[string]interface{})
-		if !ok {
-			return nil, false
-		}
-		data = obj
 	}
-	value, ok := data[path[len(path)-1]]
-	return value, ok
+
+	return newBundles, updatedBundles, deletedBundles
 }

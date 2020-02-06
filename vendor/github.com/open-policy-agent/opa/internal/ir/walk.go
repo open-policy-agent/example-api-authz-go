@@ -46,21 +46,39 @@ func (w *walkerImpl) walk(x interface{}) {
 	case *Policy:
 		w.walk(x.Static)
 		w.walk(x.Plan)
-	case Static:
+		w.walk(x.Funcs)
+	case *Static:
 		for _, s := range x.Strings {
 			w.walk(s)
 		}
-	case Plan:
+		for _, f := range x.BuiltinFuncs {
+			w.walk(f)
+		}
+	case *Funcs:
+		for _, fn := range x.Funcs {
+			w.walk(fn)
+		}
+	case *Func:
 		for _, b := range x.Blocks {
 			w.walk(b)
 		}
-	case Block:
+	case *Plan:
+		for _, b := range x.Blocks {
+			w.walk(b)
+		}
+	case *Block:
 		for _, s := range x.Stmts {
 			w.walk(s)
 		}
-	case ScanStmt:
+	case *BlockStmt:
+		for _, b := range x.Blocks {
+			w.walk(b)
+		}
+	case *ScanStmt:
 		w.walk(x.Block)
-	case NotStmt:
+	case *NotStmt:
+		w.walk(x.Block)
+	case *WithStmt:
 		w.walk(x.Block)
 	}
 }

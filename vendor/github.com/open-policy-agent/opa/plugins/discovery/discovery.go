@@ -10,6 +10,10 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/open-policy-agent/opa/metrics"
+
+	"github.com/sirupsen/logrus"
+
 	"github.com/open-policy-agent/opa/ast"
 	bundleApi "github.com/open-policy-agent/opa/bundle"
 	"github.com/open-policy-agent/opa/config"
@@ -20,7 +24,6 @@ import (
 	"github.com/open-policy-agent/opa/plugins/status"
 	"github.com/open-policy-agent/opa/rego"
 	"github.com/open-policy-agent/opa/storage/inmem"
-	"github.com/sirupsen/logrus"
 )
 
 // Discovery implements configuration discovery for OPA. When discovery is
@@ -33,6 +36,7 @@ type Discovery struct {
 	downloader *download.Downloader // discovery bundle downloader
 	status     *bundle.Status       // discovery status
 	etag       string               // discovery bundle etag for caching purposes
+	metrics    metrics.Metrics
 }
 
 // Factories provides a set of factory functions to use for
@@ -40,6 +44,13 @@ type Discovery struct {
 func Factories(fs map[string]plugins.Factory) func(*Discovery) {
 	return func(d *Discovery) {
 		d.factories = fs
+	}
+}
+
+// Metrics provides a metrics provider to pass to plugins.
+func Metrics(m metrics.Metrics) func(*Discovery) {
+	return func(d *Discovery) {
+		d.metrics = m
 	}
 }
 
@@ -59,7 +70,7 @@ func New(manager *plugins.Manager, opts ...func(*Discovery)) (*Discovery, error)
 	if err != nil {
 		return nil, err
 	} else if config == nil {
-		if _, err := getPluginSet(result.factories, manager, manager.Config); err != nil {
+		if _, err := getPluginSet(result.factories, manager, manager.Config, result.metrics); err != nil {
 			return nil, err
 		}
 		return result, nil
@@ -136,7 +147,7 @@ func (c *Discovery) processUpdate(ctx context.Context, u download.Update) {
 	}
 
 	if u.ETag == c.etag {
-		c.logError("Discovery update skipped, server replied with not modified.")
+		c.logDebug("Discovery update skipped, server replied with not modified.")
 		c.status.SetError(nil)
 		return
 	}
@@ -144,7 +155,7 @@ func (c *Discovery) processUpdate(ctx context.Context, u download.Update) {
 
 func (c *Discovery) reconfigure(ctx context.Context, u download.Update) error {
 
-	config, ps, err := processBundle(ctx, c.manager, c.factories, u.Bundle, c.config.query)
+	config, ps, err := processBundle(ctx, c.manager, c.factories, u.Bundle, c.config.query, c.metrics)
 	if err != nil {
 		return err
 	}
@@ -190,24 +201,20 @@ func (c *Discovery) logrusFields() logrus.Fields {
 	}
 }
 
-func processBundle(ctx context.Context, manager *plugins.Manager, factories map[string]plugins.Factory, b *bundleApi.Bundle, query string) (*config.Config, *pluginSet, error) {
+func processBundle(ctx context.Context, manager *plugins.Manager, factories map[string]plugins.Factory, b *bundleApi.Bundle, query string, m metrics.Metrics) (*config.Config, *pluginSet, error) {
 
 	config, err := evaluateBundle(ctx, manager.ID, manager.Info, b, query)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	ps, err := getPluginSet(factories, manager, config)
+	ps, err := getPluginSet(factories, manager, config, m)
 	return config, ps, err
 }
 
 func evaluateBundle(ctx context.Context, id string, info *ast.Term, b *bundleApi.Bundle, query string) (*config.Config, error) {
 
-	modules := map[string]*ast.Module{}
-
-	for _, file := range b.Modules {
-		modules[file.Path] = file.Parsed
-	}
+	modules := b.ParsedModules("discovery")
 
 	compiler := ast.NewCompiler()
 
@@ -257,7 +264,7 @@ type pluginfactory struct {
 	config  interface{}
 }
 
-func getPluginSet(factories map[string]plugins.Factory, manager *plugins.Manager, config *config.Config) (*pluginSet, error) {
+func getPluginSet(factories map[string]plugins.Factory, manager *plugins.Manager, config *config.Config, m metrics.Metrics) (*pluginSet, error) {
 
 	// Parse and validate plugin configurations.
 	pluginNames := []string{}
@@ -284,9 +291,17 @@ func getPluginSet(factories map[string]plugins.Factory, manager *plugins.Manager
 	}
 
 	// Parse and validate bundle/logs/status configurations.
+
+	// If `bundle` was configured use that, otherwise try the new `bundles` option
 	bundleConfig, err := bundle.ParseConfig(config.Bundle, manager.Services())
 	if err != nil {
 		return nil, err
+	}
+	if bundleConfig == nil {
+		bundleConfig, err = bundle.ParseBundlesConfig(config.Bundles, manager.Services())
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	decisionLogsConfig, err := logs.ParseConfig(config.DecisionLogs, manager.Services(), pluginNames)
@@ -322,7 +337,7 @@ func getPluginSet(factories map[string]plugins.Factory, manager *plugins.Manager
 	}
 
 	if statusConfig != nil {
-		p, created := getStatusPlugin(manager, statusConfig)
+		p, created := getStatusPlugin(manager, statusConfig, m)
 		if created {
 			starts = append(starts, p)
 		} else if p != nil {
@@ -358,12 +373,12 @@ func getDecisionLogsPlugin(m *plugins.Manager, config *logs.Config) (plugin *log
 	return plugin, created
 }
 
-func getStatusPlugin(m *plugins.Manager, config *status.Config) (plugin *status.Plugin, created bool) {
+func getStatusPlugin(m *plugins.Manager, config *status.Config, metrics metrics.Metrics) (plugin *status.Plugin, created bool) {
 
 	plugin = status.Lookup(m)
 
 	if plugin == nil {
-		plugin = status.New(config, m)
+		plugin = status.New(config, m).WithMetrics(metrics)
 		m.Register(status.Name, plugin)
 		registerBundleStatusUpdates(m)
 		created = true
@@ -391,7 +406,16 @@ func registerBundleStatusUpdates(m *plugins.Manager) {
 		return
 	}
 	type pluginlistener string
-	bp.Register(pluginlistener(status.Name), func(s bundle.Status) {
-		sp.UpdateBundleStatus(s)
-	})
+
+	// Depending on how the plugin was configured we will want to use different listeners
+	// for backwards compatibility.
+	if !bp.Config().IsMultiBundle() {
+		bp.Register(pluginlistener(status.Name), func(s bundle.Status) {
+			sp.UpdateBundleStatus(s)
+		})
+	} else {
+		bp.RegisterBulkListener(pluginlistener(status.Name), func(s map[string]*bundle.Status) {
+			sp.BulkUpdateBundleStatus(s)
+		})
+	}
 }

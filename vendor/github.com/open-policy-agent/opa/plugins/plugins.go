@@ -46,7 +46,7 @@ import (
 // Validate receives a slice of bytes representing plugin
 // configuration and returns a configuration value that can be used to
 // instantiate your plugin. The manager is provided to give access to
-// the OPA's compiler, storage layer, adn global configuration. Your
+// the OPA's compiler, storage layer, and global configuration. Your
 // Validate function will typically:
 //
 //  1. Deserialize the raw config bytes
@@ -97,6 +97,27 @@ type Manager struct {
 	plugins            []namedplugin
 	registeredTriggers []func(txn storage.Transaction)
 	mtx                sync.Mutex
+}
+
+type managerContextKey string
+
+const managerCompilerContextKey = managerContextKey("compiler")
+
+// SetCompilerOnContext puts the compiler into the storage context. Calling this
+// function before committing updated policies to storage allows the manager to
+// skip parsing and compiling of modules. Instead, the manager will use the
+// compiler that was stored on the context.
+func SetCompilerOnContext(context *storage.Context, compiler *ast.Compiler) {
+	context.Put(managerCompilerContextKey, compiler)
+}
+
+// GetCompilerOnContext gets the compiler cached on the storage context.
+func GetCompilerOnContext(context *storage.Context) *ast.Compiler {
+	compiler, ok := context.Get(managerCompilerContextKey).(*ast.Compiler)
+	if !ok {
+		return nil
+	}
+	return compiler
 }
 
 type namedplugin struct {
@@ -270,8 +291,19 @@ func (m *Manager) Reconfigure(config *config.Config) error {
 
 func (m *Manager) onCommit(ctx context.Context, txn storage.Transaction, event storage.TriggerEvent) {
 	if event.PolicyChanged() {
-		compiler, _ := loadCompilerFromStore(ctx, m.Store, txn)
+
+		var compiler *ast.Compiler
+
+		// If the context does not contain the compiler fallback to loading the
+		// compiler from the store. Currently the bundle plugin sets the
+		// compiler on the context but the server does not (nor would users
+		// implementing their own policy loading.)
+		if compiler = GetCompilerOnContext(event.Context); compiler == nil {
+			compiler, _ = loadCompilerFromStore(ctx, m.Store, txn)
+		}
+
 		m.setCompiler(compiler)
+
 		for _, f := range m.registeredTriggers {
 			f(txn)
 		}
