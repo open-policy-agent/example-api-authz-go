@@ -20,3 +20,29 @@ Run the example with an [OPA Configuration File](https://www.openpolicyagent.org
 ```bash
 ./example-api-authz-go -config config.yaml
 ```
+
+The example implementation is hardcoded to assume a policy decision will be generated at path
+`system.main`. You **must** define a policy decision at that
+path. If your policies use another package, you can include an
+entrypoint policy.
+
+**Entrypoint**:
+
+```rego
+package system
+
+main = data.example.allow
+```
+
+**Your policy**:
+
+```rego
+package example
+
+default allow = false
+
+allow {
+    input.method == "GET"
+    input.user == "bob"
+}
+```
