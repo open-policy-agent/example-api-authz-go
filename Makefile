@@ -8,6 +8,3 @@ LDFLAGS := -X github.com/open-policy-agent/example-api-authz-go/internal/version
 
 build:
 	go build -ldflags "$(LDFLAGS)" ./cmd/example-api-authz-go/...
-
-update-opa:
-	@./revendor_opa.sh $(TAG)
