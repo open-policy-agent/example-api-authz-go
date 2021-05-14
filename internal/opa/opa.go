@@ -44,7 +44,6 @@ func Config(fileName string) func(opa *OPA) error {
 
 // New returns a new OPA object.
 func New(opts ...func(*OPA) error) (*OPA, error) {
-
 	opa := &OPA{}
 
 	for _, opt := range opts {
@@ -87,14 +86,12 @@ var revisionPath = storage.MustParsePath("/system/bundle/manifest/revision")
 
 // Bool returns a boolean policy decision.
 func (opa *OPA) Bool(ctx context.Context, input interface{}, opts ...func(*rego.Rego)) (bool, error) {
-
 	m := metrics.New()
 	var decisionID string
 	var revision string
 	var decision bool
 
 	err := storage.Txn(ctx, opa.manager.Store, storage.TransactionParams{}, func(txn storage.Transaction) error {
-
 		var err error
 
 		revision, err = getRevision(ctx, opa.manager.Store, txn)

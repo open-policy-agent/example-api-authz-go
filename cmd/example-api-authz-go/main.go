@@ -16,12 +16,13 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-var configFile = flag.String("config", "", "set the OPA config file to load")
-var verbose = flag.Bool("verbose", false, "enable verbose logging")
-var versionFlag = flag.Bool("version", false, "print version and exit")
+var (
+	configFile  = flag.String("config", "", "set the OPA config file to load")
+	verbose     = flag.Bool("verbose", false, "enable verbose logging")
+	versionFlag = flag.Bool("version", false, "print version and exit")
+)
 
 func main() {
-
 	flag.Parse()
 
 	if *versionFlag {

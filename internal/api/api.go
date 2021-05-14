@@ -50,7 +50,6 @@ type API struct {
 
 // New returns a instance of the API.
 func New(engine *opa.OPA) *API {
-
 	api := &API{
 		engine: engine,
 		db:     mockDB(),
@@ -110,7 +109,6 @@ func (api *API) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handlGetCars(w http.ResponseWriter, r *http.Request) {
-
 	cars := make([]Car, 0, len(api.db.Cars))
 
 	for _, car := range api.db.Cars {
@@ -127,7 +125,6 @@ func (api *API) handlGetCars(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handlePutCar(w http.ResponseWriter, r *http.Request) {
-
 	vars := mux.Vars(r)
 
 	bs, err := ioutil.ReadAll(r.Body)
@@ -150,7 +147,6 @@ func (api *API) handlePutCar(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handleDeleteCar(w http.ResponseWriter, r *http.Request) {
-
 	vars := mux.Vars(r)
 
 	id := vars["id"]
@@ -164,7 +160,6 @@ func (api *API) handleDeleteCar(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handleGetCar(w http.ResponseWriter, r *http.Request) {
-
 	vars := mux.Vars(r)
 
 	id := vars["id"]
@@ -176,7 +171,6 @@ func (api *API) handleGetCar(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handleGetCarStatus(w http.ResponseWriter, r *http.Request) {
-
 	vars := mux.Vars(r)
 
 	id := vars["id"]
@@ -188,7 +182,6 @@ func (api *API) handleGetCarStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handlePutCarStatus(w http.ResponseWriter, r *http.Request) {
-
 	vars := mux.Vars(r)
 
 	bs, err := ioutil.ReadAll(r.Body)
@@ -210,9 +203,7 @@ func (api *API) handlePutCarStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) authorize(next http.Handler) http.Handler {
-
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
 		user := r.Header.Get("Authorization")
 		path := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 
@@ -232,7 +223,6 @@ func (api *API) authorize(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		}
 	})
-
 }
 
 func writeError(w http.ResponseWriter, status int, code string, err error) {
