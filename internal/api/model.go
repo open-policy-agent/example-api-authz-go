@@ -34,7 +34,6 @@ type CarPosition struct {
 }
 
 func mockDB() DB {
-
 	cars := []Car{
 		{
 			ID:        "663dc85d-2455-466c-b2e5-76691b0ce14e",
