@@ -46,3 +46,22 @@ allow {
     input.user == "bob"
 }
 ```
+
+## Trying the example
+- As a manager, create a car (this should be allowed):
+```
+curl -H 'Authorization: alice' -H 'Content-Type: application/json' \
+    -X PUT localhost:8080/cars/test-car \
+    -d '{"model": "Toyota", "vehicle_id": "357192", "owner_id": "4821", "id": "test-car"}'
+```
+
+- As a car admin, try to delete a car (this should be denied):
+```
+curl -H 'Authorization: kelly' \
+    -X DELETE localhost:8080/cars/test-car
+```
+
+### Note
+- Example rego in [playground](https://play.openpolicyagent.org/p/QYwdV70Mac)
+
+- If it's not available in playground anymore, push the files in `/rego` to [playground](https://play.openpolicyagent.org/) and update the `config.yaml` to run the example

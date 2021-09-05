@@ -1,0 +1,13 @@
+services:
+  play:
+    url: https://play.openpolicyagent.org
+
+bundles:
+  authz:
+    service: play
+    resource: bundles/WfbLy2DbiF
+
+decision_logs:
+  console: true
+
+default_decision: /http/example/authz/allow
