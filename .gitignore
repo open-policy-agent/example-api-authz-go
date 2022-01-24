@@ -1,2 +1,5 @@
 /config.yaml
+/opa-conf.yaml
 /example-api-authz-go
+
+.idea/
