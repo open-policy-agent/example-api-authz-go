@@ -1,6 +1,6 @@
 # OPA-Go API Authorization Example
 
-This repository shows how to integrate a service written in Go with OPA to perform API authorization.
+This repository shows how to integrate a service written in Go with the OPA SDK to perform API authorization.
 
 ## Building
 

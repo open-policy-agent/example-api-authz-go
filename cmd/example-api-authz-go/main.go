@@ -5,15 +5,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/open-policy-agent/example-api-authz-go/internal/api"
-	"github.com/open-policy-agent/example-api-authz-go/internal/opa"
 	"github.com/open-policy-agent/example-api-authz-go/internal/version"
-	"github.com/sirupsen/logrus"
+	"github.com/open-policy-agent/opa/logging"
+	"github.com/open-policy-agent/opa/sdk"
 )
 
 var configFile = flag.String("config", "", "set the OPA config file to load")
@@ -24,37 +26,39 @@ func main() {
 
 	flag.Parse()
 
+	if *configFile == "" {
+		log.Fatal("Missing required --config flag")
+	}
+
 	if *versionFlag {
 		fmt.Println("Version:", version.Version)
 		fmt.Println("Vcs:", version.Vcs)
 		os.Exit(0)
 	}
 
-	setupLogging()
-
-	engine, err := opa.New(opa.Config(*configFile))
-	if err != nil {
-		logrus.WithFields(logrus.Fields{"err": err}).Fatal("Failed to initialize OPA.")
+	logLevel := logging.Info
+	if *verbose {
+		logLevel = logging.Debug
 	}
+	logger := logging.New()
+	logger.SetLevel(logLevel)
 
 	ctx := context.Background()
 
-	if err := engine.Start(ctx); err != nil {
-		logrus.WithFields(logrus.Fields{"err": err}).Fatal("Failed to start OPA.")
+	config, err := os.ReadFile(*configFile)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	if err := api.New(engine).Run(ctx); err != nil {
-		logrus.Fatal(err)
+	opa, err := sdk.New(ctx, sdk.Options{Config: bytes.NewReader(config), Logger: logger})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer opa.Stop(ctx)
+
+	if err = api.New(opa).Run(ctx); err != nil {
+		log.Fatal(err)
 	}
 
-	logrus.Info("Shutting down.")
-}
-
-func setupLogging() {
-	logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
-	logLevel := logrus.InfoLevel
-	if *verbose {
-		logLevel = logrus.DebugLevel
-	}
-	logrus.SetLevel(logLevel)
+	logger.Info("Shutting down.")
 }

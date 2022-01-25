@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/open-policy-agent/example-api-authz-go/internal/opa"
+
+	"github.com/open-policy-agent/opa/sdk"
 )
 
 type apiError struct {
@@ -43,13 +45,13 @@ const (
 
 // API implements a simple HTTP API server to expose Car data.
 type API struct {
-	engine *opa.OPA
+	engine *sdk.OPA
 	router *mux.Router
 	db     DB
 }
 
 // New returns a instance of the API.
-func New(engine *opa.OPA) *API {
+func New(engine *sdk.OPA) *API {
 
 	api := &API{
 		engine: engine,
@@ -58,7 +60,7 @@ func New(engine *opa.OPA) *API {
 
 	api.router = mux.NewRouter()
 	api.router.HandleFunc("/", api.handleIndex).Methods(http.MethodGet)
-	api.router.HandleFunc("/cars", api.handlGetCars).Methods(http.MethodGet)
+	api.router.HandleFunc("/cars", api.handleGetCars).Methods(http.MethodGet)
 	api.router.HandleFunc("/cars/{id}", api.handlePutCar).Methods(http.MethodPut)
 	api.router.HandleFunc("/cars/{id}", api.handleGetCar).Methods(http.MethodGet)
 	api.router.HandleFunc("/cars/{id}", api.handleDeleteCar).Methods(http.MethodDelete)
@@ -71,13 +73,13 @@ func New(engine *opa.OPA) *API {
 }
 
 // Run starts the HTTP server.
-func (api *API) Run(ctx context.Context) error {
+func (api *API) Run(_ context.Context) error {
 	return http.ListenAndServe(":8080", api.router)
 }
 
 func (api *API) getRoutes() []string {
 	routes := make([]string, 0)
-	api.router.Walk(func(route *mux.Route, _ *mux.Router, _ []*mux.Route) error {
+	_ = api.router.Walk(func(route *mux.Route, _ *mux.Router, _ []*mux.Route) error {
 		tmpl, err := route.GetPathTemplate()
 		if err != nil {
 			return err
@@ -97,19 +99,19 @@ func (api *API) getRoutes() []string {
 	return routes
 }
 
-func (api *API) handleNotFound(w http.ResponseWriter, r *http.Request) {
+func (api *API) handleNotFound(w http.ResponseWriter, _ *http.Request) {
 	var resp apiRouteNotFoundError
 	resp.Error.Routes = api.getRoutes()
 	resp.Error.Code = apiCodeNotFound
 	writeJSON(w, http.StatusNotFound, resp)
 }
 
-func (api *API) handleIndex(w http.ResponseWriter, r *http.Request) {
+func (api *API) handleIndex(w http.ResponseWriter, _ *http.Request) {
 	routes := api.getRoutes()
 	writeJSON(w, http.StatusOK, routes)
 }
 
-func (api *API) handlGetCars(w http.ResponseWriter, r *http.Request) {
+func (api *API) handleGetCars(w http.ResponseWriter, _ *http.Request) {
 
 	cars := make([]Car, 0, len(api.db.Cars))
 
@@ -212,7 +214,6 @@ func (api *API) handlePutCarStatus(w http.ResponseWriter, r *http.Request) {
 func (api *API) authorize(next http.Handler) http.Handler {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
 		user := r.Header.Get("Authorization")
 		path := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 
@@ -222,7 +223,16 @@ func (api *API) authorize(next http.Handler) http.Handler {
 			"user":   user,
 		}
 
-		allowed, err := api.engine.Bool(r.Context(), input)
+		result, err := api.engine.Decision(r.Context(), sdk.DecisionOptions{
+			Now:   time.Now(),
+			Path:  "/system/main/allow",
+			Input: input,
+		})
+
+		var allowed bool
+		if b, ok := result.Result.(bool); ok {
+			allowed = b
+		}
 
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, apiCodeInternalError, err)
@@ -248,5 +258,5 @@ func writeJSON(w http.ResponseWriter, status int, x interface{}) {
 	bs, _ := json.Marshal(x)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	w.Write(bs)
+	_, _ = w.Write(bs)
 }
