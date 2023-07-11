@@ -50,11 +50,17 @@ func main() {
 		log.Fatal(err)
 	}
 
-	opa, err := sdk.New(ctx, sdk.Options{Config: bytes.NewReader(config), Logger: logger})
+	ready := make(chan struct{})
+	opa, err := sdk.New(ctx, sdk.Options{
+		Config: bytes.NewReader(config),
+		Logger: logger,
+		Ready:  ready,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer opa.Stop(ctx)
+	<-ready
 
 	if err = api.New(opa).Run(ctx); err != nil {
 		log.Fatal(err)

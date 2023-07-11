@@ -1,0 +1,8 @@
+services:
+- name: main
+  url: http://bundlesrv
+bundles:
+  bundle.tar.gz:
+    service: main
+decision_logs:
+  console: true

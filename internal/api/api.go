@@ -73,7 +73,7 @@ func New(engine *sdk.OPA) *API {
 }
 
 // Run starts the HTTP server.
-func (api *API) Run(_ context.Context) error {
+func (api *API) Run(context.Context) error {
 	return http.ListenAndServe(":8080", api.router)
 }
 

@@ -1,0 +1,17 @@
+{:tasks
+ {:requires ([babashka.wait :as wait])
+  test:setup (do
+               (shell "opa build bundle/")
+               (shell "mv bundle.tar.gz bundles/")
+               (shell "docker compose up -d")
+               (wait/wait-for-port "localhost" 8080))
+  test:teardown (shell "docker compose down")
+  test:api {:extra-paths ["test"]
+            :extra-deps {io.github.cognitect-labs/test-runner
+                         {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+            :task (exec 'cognitect.test-runner.api/test)
+            :exec-args {:dirs ["test"]}
+            :org.babashka/cli {:coerce {:nses [:symbol]
+                                        :vars [:symbol]}}}
+  tests {:depends [test:setup test:api test:teardown]
+         :task (println "running API tests")}}}

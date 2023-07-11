@@ -1,0 +1,35 @@
+name: PR Check
+
+on: [pull_request]
+
+# When a new revision is pushed to a PR, cancel all in-progress CI runs for that
+# PR. See https://docs.github.com/en/actions/using-jobs/using-concurrency
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: open-policy-agent/setup-opa@v2
+      - uses: ko-build/setup-ko@v0.6
+      - uses: turtlequeue/setup-babashka@v1.5.0
+        with:
+          babashka-version: 1.3.181
+
+      - uses: actions/checkout@v3
+      - uses: actions/setup-go@v4
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Build image
+        id: app
+        run: echo "image=$(ko build --local ./cmd/example-api-authz-go)" >> $GITHUB_OUTPUT
+      - name: Run API tests
+        working-directory: e2e
+        run: bb run tests
+        env:
+          IMAGE: ${{ steps.app.outputs.image }}
