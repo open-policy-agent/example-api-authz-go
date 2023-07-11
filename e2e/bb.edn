@@ -1,6 +1,5 @@
 {:tasks
- {:requires ([babashka.wait :as wait])
-  test:setup (do
+ {test:setup (do
                (shell "opa build bundle/")
                (shell "mv bundle.tar.gz bundles/")
                (shell "docker compose up --wait --quiet-pull"))
