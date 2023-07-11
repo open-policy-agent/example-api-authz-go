@@ -4,7 +4,7 @@
 
 (def endpoint "http://127.0.0.1:8080/")
 
-(defn request [headers] (http/get (str endpoint "/cars") {:headers headers :throw false}))
+(defn request [headers] (http/get (str endpoint "/cars") {:socket-timeout 1000 :conn-timeout 1000 :headers headers :throw false}))
 
 (deftest authorized-cars
   (testing "bob is authorized to list all cars"
