@@ -33,3 +33,7 @@ jobs:
         run: bb run tests
         env:
           IMAGE: ${{ steps.app.outputs.image }}
+
+      - name: Dump logs
+        run: docker compose logs
+        if: ${{ failure() }}
