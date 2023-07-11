@@ -3,8 +3,7 @@
   test:setup (do
                (shell "opa build bundle/")
                (shell "mv bundle.tar.gz bundles/")
-               (shell "docker compose up -d")
-               (wait/wait-for-port "localhost" 8080))
+               (shell "docker compose up --wait --quiet-pull"))
   test:teardown (shell "docker compose down")
   test:api {:extra-paths ["test"]
             :extra-deps {io.github.cognitect-labs/test-runner
