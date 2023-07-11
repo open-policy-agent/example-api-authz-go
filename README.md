@@ -31,7 +31,7 @@ entrypoint policy.
 ```rego
 package system
 
-main = data.example.allow
+main = data.example # api queries data.system.main.allow
 ```
 
 **Your policy**:
@@ -39,9 +39,11 @@ main = data.example.allow
 ```rego
 package example
 
-default allow = false
+import future.keywords.if
 
-allow {
+default allow := false
+
+allow if {
     input.method == "GET"
     input.user == "bob"
 }

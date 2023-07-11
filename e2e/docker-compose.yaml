@@ -1,0 +1,24 @@
+version: '3'
+services:
+  api-service:
+    image: ${IMAGE}
+    ports:
+    - "8080:8080"
+    command:
+    - -config=/opa.yml
+    - -verbose
+    volumes:
+    - ./opa.yml:/opa.yml
+  bundlesrv:
+    image: python:3
+    command:
+    - python
+    - -m
+    - http.server
+    - "80"
+    - -d
+    - /w
+    ports:
+    - 8000:80
+    volumes:
+    - ./:/w
