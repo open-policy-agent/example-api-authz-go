@@ -7,7 +7,7 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -132,7 +132,7 @@ func (api *API) handlePutCar(w http.ResponseWriter, r *http.Request) {
 
 	vars := mux.Vars(r)
 
-	bs, err := ioutil.ReadAll(r.Body)
+	bs, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, apiCodeInternalError, err)
 		return
@@ -193,7 +193,7 @@ func (api *API) handlePutCarStatus(w http.ResponseWriter, r *http.Request) {
 
 	vars := mux.Vars(r)
 
-	bs, err := ioutil.ReadAll(r.Body)
+	bs, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, apiCodeInternalError, err)
 		return
