@@ -18,7 +18,7 @@ type Car struct {
 	OwnerID   string `json:"owner_id"`
 }
 
-// CarStatus reprents the status of a car managed by the service.
+// CarStatus represents the status of a car managed by the service.
 type CarStatus struct {
 	ID       string      `json:"id"`
 	Position CarPosition `json:"position"`
